@@ -1,383 +1,493 @@
-# digital_wellness_final_updated.py
-# Final integrated Flask app (Frontend + Backend)
-# Analytics removed, Resources section updated with links.
-
 import os
 import json
 import uuid
 import random
-from datetime import datetime, date
-from flask import Flask, request, session, redirect, url_for
-import pandas as pd
+from datetime import datetime
+
+from flask import Flask, request, session, redirect, url_for, jsonify
+from markupsafe import escape
+from flask_socketio import SocketIO, emit, join_room
 
 app = Flask(__name__)
-app.secret_key = "replace_this_secret_in_production_2025"
+app.secret_key = "wellness_app_secret_2025"
+
+socketio = SocketIO(app, async_mode="eventlet")
 
 STATE_FILE = "wellness_state.json"
+CHAT_LOG_CSV = "chat_logs.csv"
 
-# --- Static Data (as per report) ---
-COUNSELORS = [
-    {"name": "Dr. Priya Sharma", "specialty": "Stress & Anxiety"},
-    {"name": "Ms. Neha Verma", "specialty": "Grief & Loss"},
-    {"name": "Mr. Rohan Gupta", "specialty": "Relationship Issues"},
-]
+waiting_user = None
+user_rooms = {}
 
-# Added links to each resource
-RESOURCES = [
-    {
-        'ID': 'R001',
-        'Title': 'Quick Grounding Exercise',
-        'Type': 'Text',
-        'Category': 'Anxiety',
-        'Description': 'A simple technique to focus on the present moment.',
-        'Link': 'https://www.healthline.com/health/grounding-techniques'
-    },
-    {
-        'ID': 'R002',
-        'Title': 'Gentle Guided Meditation',
-        'Type': 'Audio',
-        'Category': 'Mindfulness',
-        'Description': 'A 10-minute audio to help relax your mind and body.',
-        'Link': 'https://www.youtube.com/watch?v=inpok4MKVLM'
-    },
-    {
-        'ID': 'R003',
-        'Title': 'Understanding Stress Cycles',
-        'Type': 'Video',
-        'Category': 'Wellness',
-        'Description': 'An informational video explaining how stress affects the body.',
-        'Link': 'https://www.youtube.com/watch?v=hnpQrMqDoqE'
-    },
-    {
-        'ID': 'R004',
-        'Title': 'Helpful Helpline Numbers',
-        'Type': 'Text',
-        'Category': 'Crisis',
-        'Description': 'A list of 24/7 crisis and support phone numbers.',
-        'Link': 'https://findahelpline.com'
-    },
-    {
-        'ID': 'R005',
-        'Title': 'Managing Anxiety with Breathing',
-        'Type': 'Text',
-        'Category': 'Anxiety',
-        'Description': 'A step-by-step guide to 4-7-8 breathing.',
-        'Link': 'https://psychcentral.com/health/4-7-8-breathing'
-    }
-]
 
-# -------------------------
-# JSON State Management
-# -------------------------
+# -------------------- UTILITIES --------------------
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
-            with open(STATE_FILE, 'r') as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {
-        "peer_queue": [],
-        "booked_requests": [],
-        "active_rooms": {},
-        "rooms": {},
-        "chat_logs": []
-    }
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+                if "bookings" not in state:
+                    state["bookings"] = []
+                return state
+        except:
+            pass
+    return {"bookings": []}
 
 def save_state(state):
-    with open(STATE_FILE, 'w') as f:
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
 
-# -------------------------
-# Backend Logic
-# -------------------------
-class WellnessSystem:
-    def _init_(self):
-        self.state = load_state()
-        self.peer_queue = self.state.get('peer_queue', [])
-        self.booked_requests = self.state.get('booked_requests', [])
-        self.active_rooms = self.state.get('active_rooms', {})
-        self.rooms = self.state.get('rooms', {})
-        self.chat_logs = self.state.get('chat_logs', [])
+def ensure_chat_log():
+    if not os.path.exists(CHAT_LOG_CSV):
+        with open(CHAT_LOG_CSV, "w", encoding="utf-8") as f:
+            f.write("anon_id,timestamp,sender,message\n")
 
-    def simulate_bot_response(self, message, last_intent=None):
-        m = (message or "").lower().strip()
-        crisis_keywords = ["suicide", "end my life", "kill myself", "self harm", "i can't go on", "i cant go on", "die"]
-        if any(k in m for k in crisis_keywords):
-            return {"response": "🚨 IMMEDIATE DANGER DETECTED! 🚨 Please reach out now: <a href='https://findahelpline.com' target='_blank'>Find Helpline</a>", "intent": "crisis_alert", "actions": []}
+def log_chat(anon_id, sender, message):
+    ensure_chat_log()
+    ts = datetime.utcnow().isoformat()
+    safe = message.replace("\n", " ").replace(",", " ")
+    with open(CHAT_LOG_CSV, "a", encoding="utf-8") as f:
+        f.write(f"{anon_id},{ts},{sender},{safe}\n")
 
-        sadness_keys = ["depressed", "depression", "sad", "unhappy", "low", "down", "hopeless"]
-        anxiety_keys = ["stressed", "stress", "anxiety", "anxious", "worried", "panic"]
-        lonely_keys = ["alone", "lonely"]
+def get_anon():
+    if "anon_id" not in session:
+        session["anon_id"] = "a-" + uuid.uuid4().hex[:8]
+    return session["anon_id"]
 
-        if any(k in m for k in sadness_keys + anxiety_keys + lonely_keys):
-            resp = random.choice([
-                "I'm really sorry you're feeling that way 💚 You’re not alone.",
-                "That sounds really tough. Let's find something that can help.",
-                "I hear you. Let's explore some support options below."
-            ])
-            actions = [
-                ("💬 Talk to a peer", "/peer"),
-                ("👩‍⚕ Request a counselor", "/book"),
-                ("🧘 View calming resources", "/resources")
-            ]
-            return {"response": resp, "intent": "serious_emotion", "actions": actions}
 
-        if any(g in m for g in ["hi", "hello", "hey"]):
-            return {"response": "Hello! I'm your wellness assistant 🌱 How are you feeling today?", "intent": "greeting", "actions": []}
+# -------------------- UPGRADED SMART CHATBOT --------------------
+def bot_reply(text):
+    t = (text or "").lower().strip()
 
-        return {"response": "I'm here for you. Would you like to explore resources or connect with a peer?", 
-                "intent": "unknown", 
-                "actions": [("💬 Talk to a peer", "/peer"),("👩‍⚕ Request a counselor", "/book"),("🧘 View resources", "/resources")]}
+    crisis = [
+        "suicide", "kill myself", "die", "end my life",
+        "want to die", "give up", "self harm", "cut myself"
+    ]
 
-    def add_booking(self, counselor_name, date_str, time_str, user_id=None):
-        try:
-            d = datetime.strptime(date_str, "%Y-%m-%d").date()
-        except Exception:
-            return None, "Invalid date format."
-        if d < date.today():
-            return None, "Date is in the past."
-        req = {"id": str(uuid.uuid4())[:10], "counselor": counselor_name, "date": date_str, "time": time_str, "status": "Pending Confirmation", "user_id": user_id}
-        self.booked_requests.append(req)
-        self.state['booked_requests'] = self.booked_requests
-        save_state(self.state)
-        return req, None
+    medium = [
+        "stress", "anxiety", "sad", "panic", "overwhelmed",
+        "tired", "depressed", "worthless", "lonely"
+    ]
 
-    # Peer-to-peer functions
-    def join_queue_and_match(self, user_id, topic=None):
-        state = load_state()
-        queue = state.get("peer_queue", [])
-        partner = None
-        for i, uid in enumerate(queue):
-            if uid != user_id:
-                partner = uid
-                queue.pop(i)
-                break
-        if partner:
-            room_id = str(uuid.uuid4())[:8]
-            ar = state.get("active_rooms", {})
-            ar[user_id] = {"room_id": room_id, "partner_id": partner, "topic": topic}
-            ar[partner] = {"room_id": room_id, "partner_id": user_id, "topic": topic}
-            rooms = state.get("rooms", {})
-            rooms[room_id] = []
-            state.update({"peer_queue": queue, "active_rooms": ar, "rooms": rooms})
-            save_state(state)
-            return {"matched": True, "room_id": room_id, "partner_id": partner}
-        if user_id not in queue:
-            queue.append(user_id)
-        state["peer_queue"] = queue
-        save_state(state)
-        return {"matched": False, "queue_size": len(queue)}
+    peer_keywords = ["peer chat", "peer", "talk to someone"]
+    res_keywords = ["resource", "resources", "material", "help article"]
+    book_keywords = ["book", "session", "appointment", "counselor", "counselling"]
 
-    def post_room_message(self, room_id, who_label, text):
-        state = load_state()
-        rooms = state.get("rooms", {})
-        if room_id not in rooms:
-            rooms[room_id] = []
-        ts = datetime.utcnow().isoformat()
-        rooms[room_id].append({"who": who_label, "text": text, "ts": ts})
-        state["rooms"] = rooms
-        save_state(state)
+    greetings = ["hi", "hello", "hey", "wassup", "sup", "yo", "hiii"]
 
-    def get_active_room_for_user(self, user_id):
-        return load_state().get("active_rooms", {}).get(user_id)
+    # Human-like greetings
+    greeting_responses = [
+        "Hey! It’s nice to hear from you. How are you feeling today?",
+        "Hello! I'm here with you — what’s on your mind?",
+        "Hi! Tell me whatever you feel comfortable sharing.",
+        "Hey! I'm listening. How are things going?"
+    ]
 
-    def end_room(self, room_id):
-        state = load_state()
-        ar = state.get("active_rooms", {})
-        for uid, info in list(ar.items()):
-            if info.get("room_id") == room_id:
-                ar.pop(uid)
-        state["active_rooms"] = ar
-        save_state(state)
+    # Empathetic supporting replies
+    natural_replies = [
+        "I understand… that must be tough. What made you feel this way?",
+        "Thanks for sharing that. Want to talk about what started these feelings?",
+        "I hear you. It’s okay to feel this way. What happened?",
+        "That sounds heavy… I’m here with you. Want to explain more?",
+        "Emotions can feel overwhelming sometimes. Want to share more?",
+        "I'm here for you. Take your time — what’s bothering you?"
+    ]
 
-system = WellnessSystem()
+    # Crisis detection
+    if any(w in t for w in crisis):
+        return {
+            "type": "crisis",
+            "message": (
+                "⚠ I’m really worried for your safety.<br>"
+                "Please reach out immediately.<br><br>"
+                "📞 <b>AASRA:</b> 91-9820466726<br>"
+                "📞 <b>Snehi:</b> +91-9582208181<br>"
+            )
+        }
 
-# -------------------------
-# UI & Routes
-# -------------------------
-def get_session_user_id():
-    if 'user_id' not in session:
-        session['user_id'] = str(uuid.uuid4())[:8]
-    return session['user_id']
+    # Redirect triggers
+    if any(w in t for w in peer_keywords):
+        return {"type": "redirect_peer", "message": "Connecting you to a peer…"}
 
-BASE_NAV = """
-<div style="background:#007f5f;padding:12px;">
-  <a href="/" style="color:white;margin-right:20px;">🏠 Home</a>
-  <a href="/chat" style="color:white;margin-right:20px;">💬 Chat</a>
-  <a href="/peer" style="color:white;margin-right:20px;">🤝 Peer Chat</a>
-  <a href="/book" style="color:white;margin-right:20px;">📅 Book</a>
-  <a href="/resources" style="color:white;">📚 Resources</a>
-</div>
-"""
+    if any(w in t for w in res_keywords):
+        return {"type": "redirect_resources", "message": "Taking you to resources…"}
 
+    if any(w in t for w in book_keywords):
+        return {"type": "redirect_book", "message": "Opening counseling session booking…"}
+
+    # Medium distress → show soft option cards
+    if any(w in t for w in medium):
+        return {
+            "type": "choices",
+            "message": (
+                "<div style='margin:10px 0;font-size:15px;color:#333;'>"
+                "It sounds like you're going through something difficult. I’m here with you — "
+                "you can choose what feels right for you:"
+                "</div>"
+
+                "<div style='background:#e8f9f0;padding:12px;margin:8px 0;border-radius:10px;"
+                "box-shadow:0 2px 6px rgba(0,0,0,0.1);'>"
+                "<a href='/peer' style='text-decoration:none;color:#2b6e4f;font-weight:600;'>💬 Peer Chat</a></div>"
+
+                "<div style='background:#eef2ff;padding:12px;margin:8px 0;border-radius:10px;"
+                "box-shadow:0 2px 6px rgba(0,0,0,0.1);'>"
+                "<a href='/resources' style='text-decoration:none;color:#3b4fa4;font-weight:600;'>📚 Wellness Resources</a></div>"
+
+                "<div style='background:#fff3df;padding:12px;margin:8px 0;border-radius:10px;"
+                "box-shadow:0 2px 6px rgba(0,0,0,0.1);'>"
+                "<a href='/book' style='text-decoration:none;color:#aa5a00;font-weight:600;'>🧑‍⚕ Book a Counseling Session</a></div>"
+            )
+        }
+
+    # Greetings
+    if any(t.startswith(g) for g in greetings):
+        return {"type": "normal", "message": random.choice(greeting_responses)}
+
+    # Normal supportive conversation
+    return {"type": "normal", "message": random.choice(natural_replies)}
+
+
+# -------------------- NEW HOMEPAGE WITH 4 OPTIONS --------------------
 @app.route("/")
 def home():
-    uid = get_session_user_id()
-    return BASE_NAV + f"""
-    <div style='font-family:Arial;margin:30px;'>
-    <h1>🌿 Digital Wellness Support System</h1>
-    <p>Welcome! Your anonymous ID: <b>{uid}</b></p>
-    <p>Use the Chatbot for emotional support, connect with peers, or request a counselor.</p>
+    anon = get_anon()
+    return f"""
+    <html><head>
+    <style>
+    body {{
+        font-family: Arial;
+        background: linear-gradient(to bottom, #dff6ff, #ffffff);
+        padding: 40px;
+    }}
+    .menu {{
+        max-width: 700px;
+        margin: auto;
+        background: white;
+        padding: 30px;
+        border-radius: 14px;
+        box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+        text-align: center;
+    }}
+    .btn {{
+        display:block;
+        padding:12px;
+        margin:10px auto;
+        width:80%;
+        background:#2b6e4f;
+        color:white;
+        text-decoration:none;
+        border-radius:8px;
+        font-size:15px;
+        font-weight:600;
+    }}
+    </style>
+    </head>
+    <body>
+
+    <div class="menu">
+        <h2 style="color:#2b6e4f;">Digital Wellness Assistant</h2>
+        <p>Your anonymous ID: <b>{escape(anon)}</b></p>
+
+        <a href="/chat" class="btn">🤖 Chat with Wellness Bot</a>
+        <a href="/peer" class="btn" style="background:#3d8f68;">💬 Peer-to-Peer Chat</a>
+        <a href="/resources" class="btn" style="background:#597dff;">📚 Wellness Resources</a>
+        <a href="/book" class="btn" style="background:#ff9f45;">🧑‍⚕ Book a Counseling Session</a>
     </div>
+
+    </body></html>
     """
 
-@app.route("/chat", methods=["GET","POST"])
+
+# -------------------- CHATBOT PAGE --------------------
+@app.route("/chat")
 def chat():
-    uid = get_session_user_id()
-    if 'chat_history' not in session:
-        session['chat_history'] = [{'type':'bot','text':"Hi — I'm your first-level wellness assistant. How can I support you today?"}]
-        session['last_intent'] = None
+    anon = get_anon()
+    return f"""
+    <html><head>
+    <style>
+    body {{ font-family:Arial; background:#f3f9fb; padding:20px; }}
+    .chatbox {{
+        background:white; border-radius:10px; padding:20px;
+        max-width:700px; margin:auto;
+        box-shadow:0 4px 14px rgba(0,0,0,0.1);
+    }}
+    #messages {{
+        height:350px; overflow:auto; padding:10px;
+        border:1px solid #ddd; border-radius:8px;
+        background:#fafafa;
+    }}
+    .input-area {{
+        margin-top:10px; display:flex; gap:8px;
+    }}
+    input {{
+        flex:1; padding:10px; border-radius:8px; border:1px solid #ccc;
+    }}
+    button {{
+        background:#2b6e4f; color:white; border:none; border-radius:8px;
+        padding:10px 16px;
+    }}
+    </style>
+    </head>
+    <body>
 
-    history = session['chat_history']
-    last_intent = session.get('last_intent')
+    <div class="chatbox">
+      <h3 style="color:#2b6e4f;">Chat with Wellness Assistant</h3>
 
-    if request.method == "POST":
-        user_msg = request.form.get("message","").strip()
-        if user_msg:
-            history.append({'type':'user','text': user_msg})
-            bot_data = system.simulate_bot_response(user_msg, last_intent)
-            bot_resp = bot_data.get('response','')
-            intent = bot_data.get('intent','unknown')
-            actions = bot_data.get('actions', [])
-            history.append({'type':'bot','text': bot_resp})
-            if actions:
-                buttons_html = "".join([f"<a href='{path}' style='display:inline-block;margin:6px;padding:8px 12px;background:#007f5f;color:white;border-radius:6px;text-decoration:none;'>{label}</a>" for label, path in actions])
-                history.append({'type':'bot','text': buttons_html})
-            session['chat_history'] = history
-            session['last_intent'] = intent
-        return redirect(url_for('chat'))
+      <div id="messages"></div>
 
-    chat_html = ""
-    for msg in history:
-        align = 'right' if msg['type']=='user' else 'left'
-        color = '#000' if msg['type']=='user' else '#006400'
-        chat_html += f"<div style='text-align:{align};margin:6px;color:{color}'><b>{'You' if msg['type']=='user' else 'Bot'}:</b> {msg['text']}</div>"
+      <div class="input-area">
+        <input id="text" placeholder="Type your message...">
+        <button onclick="sendMsg()">Send</button>
+      </div>
+    </div>
 
-    return BASE_NAV + f"""
-    <div style='font-family:Arial;width:80%;margin:20px auto;'>
-      <h2>💬 Chatbot</h2>
-      <div style='border:1px solid #ccc;padding:10px;height:320px;overflow:auto;background:#f9f9f9;'>{chat_html}</div>
-      <form method='POST' style='margin-top:10px;'>
-        <input name='message' placeholder='Type here...' style='width:70%;padding:8px;' required>
-        <button type='submit' style='padding:8px;background:#007f5f;color:white;border:none;border-radius:6px;'>Send</button>
-        <a href='/chat/clear' style='margin-left:10px;'>Clear</a>
-      </form>
+<script>
+function append(who, msg) {{
+    let m = document.getElementById("messages");
+    let div = document.createElement("div");
+    div.style.margin = "8px 0";
+    div.innerHTML = "<b>" + who + ":</b> " + msg;
+    m.appendChild(div);
+    m.scrollTop = m.scrollHeight;
+}}
+
+async function sendMsg() {{
+    let inp = document.getElementById("text");
+    let t = inp.value.trim();
+    if (!t) return;
+    append("You", t);
+    inp.value = "";
+
+    let r = await fetch("/chatbot", {{
+        method:"POST",
+        headers:{{"Content-Type":"application/json"}},
+        body:JSON.stringify({{anon_id:"{anon}", message:t}})
+    }});
+    let data = await r.json();
+    append("Bot", data.message);
+
+    if (data.type === "redirect_peer") {{
+        window.location.href = "/peer";
+    }}
+    if (data.type === "redirect_resources") {{
+        window.location.href = "/resources";
+    }}
+    if (data.type === "redirect_book") {{
+        window.location.href = "/book";
+    }}
+}}
+</script>
+
+    </body></html>
+    """
+
+
+# -------------------- HELP PAGE --------------------
+@app.route("/help")
+def help_page():
+    anon = get_anon()
+    return f"""
+    <div style="font-family:Arial;max-width:650px;margin:40px auto;background:white;padding:20px;
+                border-radius:12px;box-shadow:0 4px 14px rgba(0,0,0,0.1);">
+
+      <h3 style="color:#2b6e4f;">Support Options</h3>
+      <p>Your ID: <b>{escape(anon)}</b></p>
+
+      <a href="/peer" style="display:block;padding:10px;background:#2b6e4f;color:white;
+                             text-decoration:none;margin:8px;border-radius:6px;">💬 Peer Chat</a>
+
+      <a href="/resources" style="display:block;padding:10px;background:#597dff;color:white;
+                                 text-decoration:none;margin:8px;border-radius:6px;">📚 Resources</a>
+
+      <a href="/book" style="display:block;padding:10px;background:#ff9f45;color:white;
+                             text-decoration:none;margin:8px;border-radius:6px;">🧑‍⚕ Book Session</a>
+
+      <a href="/" style="color:#2b6e4f;">← Back</a>
     </div>
     """
 
-@app.route("/chat/clear")
-def chat_clear():
-    session.pop('chat_history', None)
-    session.pop('last_intent', None)
-    return redirect(url_for('chat'))
 
-@app.route("/peer", methods=["GET","POST"])
+# -------------------- PEER CHAT PAGE --------------------
+@app.route("/peer")
 def peer():
-    uid = get_session_user_id()
-    msg = ""
-    if request.method == "POST":
-        action = request.form.get("action")
-        if action == "join":
-            topic = request.form.get("topic") or None
-            res = system.join_queue_and_match(uid, topic)
-            if res.get("matched"):
-                return redirect(url_for("room", room_id=res["room_id"]))
-            else:
-                msg = f"You joined the queue. Queue size: {res.get('queue_size')}"
-        elif action == "leave":
-            system.leave_queue(uid)
-            msg = "Left the queue."
+    anon = get_anon()
+    return f"""
+    <html><head>
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <style>
+    body {{ font-family:Arial;background:#f3f9fb;padding:20px; }}
+    .box {{
+        background:white;max-width:700px;margin:auto;padding:20px;border-radius:12px;
+        box-shadow:0 4px 14px rgba(0,0,0,0.1);
+    }}
+    #chatbox {{
+        height:330px;border:1px solid #ccc;border-radius:8px;padding:10px;
+        overflow:auto;background:#fafafa;
+    }}
+    </style>
+    </head>
 
-    st = load_state()
-    qlen = len(st.get("peer_queue", []))
-    active = system.get_active_room_for_user(uid)
-    active_html = f"<p>You are in room <b>{active['room_id']}</b>. <a href='/room/{active['room_id']}'>Open</a></p>" if active else ""
+    <body>
+      <div class="box">
+        <h3 style="color:#2b6e4f;">Peer Support Chat</h3>
+        <p>Your ID: <b>{escape(anon)}</b></p>
 
-    return BASE_NAV + f"""
-    <div style='font-family:Arial;margin:30px;width:60%;'>
-      <h2>🤝 Peer Chat</h2>
-      <p>{msg}</p>{active_html}
-      <form method='POST'>
-        <label>Topic (optional)</label><br>
-        <input name='topic' placeholder='e.g. stress, anxiety' style='width:100%;padding:8px;'><br><br>
-        <button name='action' value='join' style='padding:8px 12px;background:#007f5f;color:white;border:none;border-radius:6px;'>Join Queue</button>
-        <button name='action' value='leave' style='padding:8px 12px;margin-left:8px;'>Leave Queue</button>
-      </form>
-      <hr><p>Queue length: {qlen}</p>
-    </div>
+        <div id="status" style="margin-bottom:10px;">Connecting...</div>
+        <div id="chatbox"></div>
+
+        <form id="form" style="display:flex;gap:8px;margin-top:10px;">
+          <input id="msg" placeholder="Type a message..."
+                 style="flex:1;padding:10px;border:1px solid #ccc;border-radius:8px;">
+          <button style="background:#2b6e4f;color:white;border:none;border-radius:8px;padding:10px 18px;">Send</button>
+        </form>
+      </div>
+
+<script>
+const anon = "{escape(anon)}";
+const socket = io();
+
+function append(who, text) {{
+    const box = document.getElementById("chatbox");
+    let div = document.createElement("div");
+    div.style.margin = "6px 0";
+    div.innerHTML = "<b>" + who + ":</b> " + text;
+    box.appendChild(div);
+    box.scrollTop = box.scrollHeight;
+}}
+
+socket.on("connect", () => {{
+    document.getElementById("status").innerText = "Connected. Waiting for peer...";
+    socket.emit("join_peer", {{anon_id: anon}});
+}});
+
+socket.on("status", data => {{
+    document.getElementById("status").innerText = data.message;
+}});
+
+socket.on("peer_message", data => {{
+    append(data.from, data.message);
+}});
+
+document.getElementById("form").addEventListener("submit", function(e){{
+    e.preventDefault();
+    let text = document.getElementById("msg").value.trim();
+    if (!text) return;
+    append("You", text);
+    socket.emit("peer_message", {{anon_id: anon, message: text}});
+    document.getElementById("msg").value = "";
+}});
+</script>
+
+    </body></html>
     """
 
-@app.route("/room/<room_id>", methods=["GET","POST"])
-def room(room_id):
-    uid = get_session_user_id()
-    st = load_state()
-    messages = st.get("rooms", {}).get(room_id, [])
-    if request.method == "POST":
-        text = request.form.get("text","").strip()
-        if text:
-            system.post_room_message(room_id, uid, text)
-            return redirect(url_for("room", room_id=room_id))
-    html = "".join([f"<div style='margin:6px;'><b>{m['who']}</b>: {m['text']}</div>" for m in messages])
-    return BASE_NAV + f"""
-    <div style='font-family:Arial;width:80%;margin:20px auto;'>
-      <h2>Room {room_id}</h2>
-      <div style='border:1px solid #ccc;padding:10px;height:300px;overflow:auto;background:white;'>{html or '<i>No messages yet</i>'}</div>
-      <form method='POST' style='margin-top:8px;'>
-        <input name='text' placeholder='Type message...' style='width:70%;padding:8px;' required>
-        <button type='submit' style='padding:8px;background:#007f5f;color:white;border:none;border-radius:6px;'>Send</button>
-      </form>
-    </div>
-    """
 
-@app.route("/book", methods=["GET","POST"])
-def book():
-    uid = get_session_user_id()
-    if request.method == "POST":
-        counselor = request.form.get("counselor")
-        date_str = request.form.get("date")
-        time_str = request.form.get("time")
-        req, err = system.add_booking(counselor, date_str, time_str, uid)
-        if err:
-            return BASE_NAV + f"<div style='margin:30px;font-family:Arial;color:red;'>Error: {err}</div>"
-        return BASE_NAV + f"<div style='margin:30px;font-family:Arial;'><h3>✅ Booking Confirmed</h3><p>{counselor} on {date_str} at {time_str}</p></div>"
-
-    options = "".join([f"<option value='{c['name']}'>{c['name']} ({c['specialty']})</option>" for c in COUNSELORS])
-    return BASE_NAV + f"""
-    <div style='font-family:Arial;margin:30px;width:60%;'>
-      <h2>📅 Book Counseling</h2>
-      <form method='POST'>
-        <label>Counselor</label><br>
-        <select name='counselor' required style='width:100%;padding:8px;'>{options}</select><br><br>
-        <label>Date</label><br>
-        <input name='date' type='date' required style='width:100%;padding:8px;'><br><br>
-        <label>Time</label><br>
-        <input name='time' required style='width:100%;padding:8px;'><br><br>
-        <button type='submit' style='padding:8px 12px;background:#007f5f;color:white;border:none;border-radius:6px;'>Submit</button>
-      </form>
-    </div>
-    """
-
+# -------------------- OTHER ROUTES --------------------
 @app.route("/resources")
 def resources():
-    html = ""
-    for r in RESOURCES:
-        html += f"""
-        <div style='border:1px solid #ccc;padding:12px;margin:8px;border-radius:8px;background:#f9f9f9;'>
-            <h3>{r['Title']} <small style='color:#666;'>({r['Type']} | {r['Category']})</small></h3>
-            <p>{r['Description']}</p>
-            <a href='{r['Link']}' target='_blank' style='background:#007f5f;color:white;padding:6px 10px;border-radius:5px;text-decoration:none;'>🔗 Open Resource</a>
-        </div>
-        """
-    return BASE_NAV + f"<div style='font-family:Arial;margin:20px;'><h2>📚 Resources</h2>{html}</div>"
+    return """
+    <div style="font-family:Arial;max-width:650px;margin:40px auto;background:white;padding:20px;
+                border-radius:12px;box-shadow:0 4px 14px rgba(0,0,0,0.1);">
+      <h3 style="color:#2b6e4f;">Helpful Resources</h3>
+      <ul>
+        <li><a target="_blank" href="https://www.healthline.com/health/grounding-techniques">Grounding Techniques</a></li>
+        <li><a target="_blank" href="https://www.youtube.com/watch?v=inpok4MKVLM">Breathing Exercise</a></li>
+        <li><a target="_blank" href="https://www.youtube.com/watch?v=hnpQrMqDoqE">Stress Explained</a></li>
+      </ul>
+      <a href="/help" style="color:#2b6e4f;">← Back</a>
+    </div>
+    """
 
-# -------------------------
-# Run App
-# -------------------------
+
+@app.route("/book", methods=["GET", "POST"])
+def book():
+    anon = get_anon()
+    state = load_state()
+
+    if request.method == "POST":
+        dt = request.form.get("datetime", "").strip()
+        if dt:
+            state["bookings"].append({"anon_id": anon, "datetime": dt})
+            save_state(state)
+            return f"<p>Session booked for {escape(dt)} ✔</p><a href='/help'>Back</a>"
+
+    return """
+    <div style="font-family:Arial;max-width:650px;margin:40px auto;background:white;padding:20px;
+                border-radius:12px;box-shadow:0 4px 14px rgba(0,0,0,0.1);">
+      <h3 style="color:#2b6e4f;">Book a Session</h3>
+      <form method="POST">
+        <input name="datetime" placeholder="YYYY-MM-DD HH:MM"
+               style="padding:10px;border-radius:8px;border:1px solid #ccc;">
+        <button style="padding:10px;background:#2b6e4f;color:white;border:none;border-radius:8px;">Book</button>
+      </form>
+      <a href="/help" style="color:#2b6e4f;">← Back</a>
+    </div>
+    """
+
+
+# -------------------- CHATBOT API --------------------
+@app.route("/chatbot", methods=["POST"])
+def chatbot_api():
+    data = request.get_json() or {}
+    msg = (data.get("message") or "").strip()
+    anon = data.get("anon_id") or get_anon()
+
+    bot = bot_reply(msg)
+
+    if msg:
+        log_chat(anon, "user", msg)
+    log_chat(anon, "bot", bot["message"])
+
+    return jsonify(bot)
+
+
+# -------------------- SOCKET EVENTS FOR PEER CHAT --------------------
+@socketio.on("join_peer")
+def join_peer(data):
+    global waiting_user
+    sid = request.sid
+    anon = data.get("anon_id")
+
+    if waiting_user is None:
+        waiting_user = {"sid": sid, "anon": anon}
+        emit("status", {"message": "Waiting for peer..."})
+    else:
+        room = "room-" + uuid.uuid4().hex[:6]
+
+        join_room(room, sid=sid)
+        join_room(room, sid=waiting_user["sid"])
+
+        user_rooms[sid] = room
+        user_rooms[waiting_user["sid"]] = room
+
+        emit("status", {"message": "Connected! Start chatting."}, room=room)
+        waiting_user = None
+
+
+@socketio.on("peer_message")
+def peer_message(data):
+    sid = request.sid
+    room = user_rooms.get(sid)
+    if room:
+        emit("peer_message", {"from": data["anon_id"], "message": data["message"]}, room=room)
+
+
+@socketio.on("disconnect")
+def disconnect():
+    global waiting_user
+    sid = request.sid
+
+    if waiting_user and waiting_user["sid"] == sid:
+        waiting_user = None
+
+    room = user_rooms.pop(sid, None)
+    if room:
+        emit("status", {"message": "Your peer disconnected."}, room=room)
+
+
+# -------------------- RUN --------------------
 if __name__ == "__main__":
-    st = load_state()
-    save_state(st)
-    os.makedirs("static", exist_ok=True)
-    print("✅ Running Digital Wellness System on http://127.0.0.1:5000/")
-    app.run(debug=True)
+    ensure_chat_log()
+    print("Server running → http://127.0.0.1:5000")
+    socketio.run(app, host="0.0.0.0", port=5000, debug=True)
 
