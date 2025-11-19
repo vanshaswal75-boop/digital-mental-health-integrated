@@ -7,7 +7,7 @@ from flask import Flask, request, session, redirect, url_for, jsonify
 from markupsafe import escape
 
 
-app = Flask(__name__)
+app = Flask(_name_)
 app.secret_key = "replace_this_secret_in_production_2025"
 
 STATE_FILE = "wellness_state.json"
@@ -54,7 +54,7 @@ def bot_reply(text):
     problem_words = ["stress", "anxiety", "sad", "depressed", "panic", "overwhelmed"]
 
     if any(word in t for word in crisis_words):
-        return ("⚠️ You might be in serious danger.<br>"
+        return ("⚠ You might be in serious danger.<br>"
                 "📞 <b>AASRA:</b> 91-9820466726<br>"
                 "📞 <b>Snehi:</b> +91-9582208181<br>")
 
@@ -137,8 +137,8 @@ def help_page():
       <div style="display:flex;flex-direction:column;gap:12px;max-width:400px;margin:20px auto;">
         <a href="/peer" style="padding:10px;background:#6aa76a;color:white;text-decoration:none;border-radius:5px;">💬 Peer-to-Peer Chat</a>
         <a href="/resources" style="padding:10px;background:#8fbf8f;color:white;text-decoration:none;border-radius:5px;">📚 Wellness Resources</a>
-        <a href="/book" style="padding:10px;background:#a7d6a7;color:white;text-decoration:none;border-radius:5px;">🧑‍⚕️ Book a Counseling Session</a>
-        <a href="/helpline" style="padding:10px;background:#e57373;color:white;text-decoration:none;border-radius:5px;">☎️ Immediate Helpline</a>
+        <a href="/book" style="padding:10px;background:#a7d6a7;color:white;text-decoration:none;border-radius:5px;">🧑‍⚕ Book a Counseling Session</a>
+        <a href="/helpline" style="padding:10px;background:#e57373;color:white;text-decoration:none;border-radius:5px;">☎ Immediate Helpline</a>
       </div>
       <a href="/chat" style="color:#2b6e4f;">← Back to Chatbot</a>
     </div>
@@ -216,11 +216,10 @@ def chatbot():
     return jsonify({"reply": reply})
 
 # ------------------- RUN -------------------
-if __name__ == "__main__":
+if _name_ == "_main_":
     ensure_chat_log()
     print("✅ Running Wellness Chatbot → http://127.0.0.1:5000")
     app.run(debug=True)
-
 
 
 
